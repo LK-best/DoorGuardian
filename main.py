@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QComboBox, QLineEdit,
     QProgressBar, QTableWidget, QTableWidgetItem, QTextEdit,
-    QGroupBox, QFormLayout, QSpinBox, QMessageBox, QHeaderView
+    QGroupBox, QFormLayout, QSpinBox, QMessageBox, QHeaderView,
+    QFileDialog  # <-- Добавлен QFileDialog
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QIcon
@@ -32,9 +33,13 @@ class DoorGuardianApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("DoorGuardian - Панель управления АРМ")
         self.resize(900, 650)
+        
+        # 1. Иконка приложения (используем методы Path)
         icon_path = resource_path("assets/icon.ico")
-        if os.path.exists(icon_path):
+        if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
+        else:
+            print(f"Иконка не найдена: {icon_path}")
 
         # 2. Загружаем стили из папки styles
         self.load_qss()
@@ -46,10 +51,10 @@ class DoorGuardianApp(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
 
-        # 1. Верхняя панель подключения COM-порта
+        # 3. Верхняя панель подключения COM-порта
         main_layout.addLayout(self.create_connection_bar())
 
-        # 2. Вкладки (Tabs)
+        # 4. Вкладки (Tabs)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.create_dashboard_tab(), "🛡️ Мониторинг")
         self.tabs.addTab(self.create_settings_tab(), "⚙️ Настройки")
@@ -65,19 +70,18 @@ class DoorGuardianApp(QMainWindow):
 
     def load_qss(self):
         """Загружает оформление из файла styles/dark.qss."""
-    
+        # Убрано self., так как resource_path - глобальная функция
         qss_path = resource_path("styles/dark.qss")
     
         try:
             stylesheet = qss_path.read_text(encoding="utf-8")
             self.setStyleSheet(stylesheet)
             print(f"Стили загружены: {qss_path}")
-    
         except FileNotFoundError:
             print(f"Файл стилей не найден: {qss_path}")
-    
         except OSError as error:
             print(f"Не удалось загрузить стили: {error}")
+
     # ================== ПАНЕЛЬ ПОДКЛЮЧЕНИЯ ==================
     def create_connection_bar(self):
         layout = QHBoxLayout()
@@ -277,7 +281,14 @@ class DoorGuardianApp(QMainWindow):
         self.table_log.setItem(row, 2, QTableWidgetItem(details))
 
     def export_csv(self):
-        path, _ = QMessageBox.getSaveFileName(self, "Сохранить CSV", "", "CSV Files (*.csv)")
+        # Заменено QMessageBox на QFileDialog и добавлено имя по умолчанию
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить CSV",
+            "door_guardian_log.csv",
+            "CSV Files (*.csv)"
+        )
+        
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
