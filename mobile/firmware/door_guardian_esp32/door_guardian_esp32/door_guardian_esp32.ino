@@ -6,6 +6,7 @@
 // Протокол (одинаковый для BLE и Serial):
 //   приложение -> ESP32 : CMD:ARM | CMD:DISARM | CMD:STATUS | TEST:LED | TEST:BUZZER | TEST:GSM
 //                         SET:PHONE=+79991234567,T1=15
+//                         SMS:+79991234567:текст  (номер "+" — взять из EEPROM)
 //   ESP32 -> приложение : STAT:DOOR=1,STATE=2,BAT=3.95  и  LOG: текст
 
 #include <EEPROM.h>
@@ -185,6 +186,17 @@ void saveSettings() {
   EEPROM.commit();  // на ESP32 без commit() данные не запишутся
 }
 
+// ========== ОТПРАВКА SMS ==========
+// TODO: подключить GSM-модуль (SIM800L/SIM7600): AT+CMGF=1, AT+CMGS="номер", текст, Ctrl+Z.
+// Пока команда подтверждается в журнале — так панель и приложение отлаживаются целиком.
+void sendSms(const String &to, const String &text) {
+  if (to.length() == 0) {
+    logLine("SMS не отправлена: номер не задан");
+    return;
+  }
+  logLine("SMS на " + to + ": " + text);
+}
+
 // ========== УПРАВЛЕНИЕ ОХРАНОЙ ==========
 void armSystem() {
   systemState = 1;
@@ -235,6 +247,18 @@ void handleCommand(String cmd) {
   else if (cmd == "TEST:GSM") {
     // TODO: реальный запрос AT к GSM-модулю
     logLine("GSM Module: OK (CSQ: 24, SIM Ready)");
+  }
+  else if (cmd.startsWith("SMS:")) {
+    // SMS:+79991234567:текст  |  SMS:+:текст (номер из EEPROM)
+    int sep = cmd.indexOf(':', 4);
+    if (sep < 0) {
+      logLine("SMS не отправлена: нет разделителя номера и текста");
+    } else {
+      String to = cmd.substring(4, sep);
+      String text = cmd.substring(sep + 1);
+      if (to == "+") to = String(phoneNumber);
+      sendSms(to, text);
+    }
   }
   else if (cmd.startsWith("SET:")) {
     // SET:PHONE=+79991234567,T1=15
