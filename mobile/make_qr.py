@@ -1,7 +1,7 @@
 import qrcode
 
 # Вставьте вашу ссылку на релиз GitHub
-url = "https://github.com/LK-best/DoorGuardian/releases/latest"
+url = "https://github.com/LK-best/DoorGuardian/releases/tag/v0.2.0"
 
 qr = qrcode.QRCode(
     version=1,
