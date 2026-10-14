@@ -1,5 +1,36 @@
 # Mobile app
 
+## Сборка APK
+
+```bash
+cd mobile
+pip install "flet[cli]>=1.0.3"
+flet build apk
+```
+
+Готовый файл — `build/apk/DoorGuardian.apk` (один "толстый" APK со всеми ABI,
+ничего дописывать не нужно). Полезные варианты:
+
+```bash
+flet build apk --split-per-abi        # отдельные APK на arm64-v8a / armeabi-v7a / x86_64
+flet build apk --arch arm64-v8a       # только 64-битные ARM-телефоны
+flet build apk --android-legacy-packaging   # меньше сам файл для сайдлоада
+```
+
+При первом запуске Flet CLI сам скачает Flutter SDK, JDK 17 и Android SDK
+(несколько гигабайт, нужен интернет). Точка входа — `src/main_2.py`, она задана
+в `pyproject.toml` (`[tool.flet.app].module`), переименовывать файл не нужно.
+
+На Windows pip часто тянет Linux-зависимости bleak: сборку APK удобнее делать в WSL.
+Установка на телефон:
+
+```cmd
+adb install -r build\apk\DoorGuardian.apk
+```
+
+Ограничение Flet на Android: `bleak` не имеет готового колеса в serious-python,
+надёжный канал на телефоне для камеры и датчиков — Wi-Fi/HTTP.
+
 ## Run the app
 
 ### uv
