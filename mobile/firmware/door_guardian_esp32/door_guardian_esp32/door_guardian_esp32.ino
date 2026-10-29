@@ -25,10 +25,11 @@
 // ВНИМАНИЕ: пины Arduino Uno (2, 3, 10) на ESP32 не подходят:
 //   GPIO10 занят флеш-памятью, GPIO3 — это RX USB-порта, GPIO2 — загрузочный.
 // Поэтому ниже безопасные пины ESP32 — подключите провода к ним (или поменяйте номера).
-const int REED_PIN   = 27;  // Датчик двери (Геркон)
-const int BTN_PIN    = 26;  // Физическая кнопка
-const int LED_PIN    = 13;  // Светодиод
-const int BUZZER_PIN = 25;  // Зуммер
+const int REED_PIN   = 4;  // Датчик двери (Геркон)
+const int BTN_PIN    = 21;  // Физическая кнопка
+const int LED_PIN    = 16;  // Светодиод
+const int BUZZER_PIN = 5;  // Зуммер
+const int LIGHT_PIN  = 18; // Датчик Света
 
 // ========== EEPROM (на ESP32 это эмуляция во флеше) ==========
 #define EEPROM_SIZE 32
@@ -159,8 +160,13 @@ void logLine(const String &msg) {
 // Отправка телеметрии (PyQt по USB и мобильное приложение по BLE)
 void sendTelemetry() {
   int state = systemState > 0 ? (systemState > 1 ? 2 : 1) : 0;
-  char buf[48];
-  snprintf(buf, sizeof(buf), "STAT:DOOR=%d,STATE=%d,BAT=%.2f", isDoorOpen ? 1 : 0, state, simBattery);
+  int lightVal = analogRead(LIGHT_PIN); // Читаем датчик света (от 0 до 4095)
+  // Конвертируем в проценты для удобства (0-100%)
+  int lightPct = map(lightVal, 0, 4095, 0, 100);
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "STAT:DOOR=%d,STATE=%d,BAT=%.2f,LIGHT=%d",
+           isDoorOpen ? 1 : 0, state, simBattery, lightPct);
   Serial.println(buf);
   bleSendLine(String(buf));
 }
@@ -213,8 +219,13 @@ void disarmSystem() {
 }
 
 void toggleArm() {
-  if (systemState == 0) armSystem();
-  else disarmSystem();
+  if (systemState == 0) {
+    armSystem();
+    logLine("🛡️ Охрана ВКЛЮЧЕНА (с кнопки)");
+  } else {
+    disarmSystem();
+    logLine("🔓 Охрана ВЫКЛЮЧЕНА (с кнопки)");
+  }
 }
 
 // ========== ОБРАБОТКА КОМАНД ==========

@@ -68,6 +68,7 @@ def main(page: ft.Page):
 
     battery_text_ref = ft.Ref[ft.Text]()
     battery_bar_ref = ft.Ref[ft.ProgressBar]()
+    light_text_ref = ft.Ref[ft.Text]()
 
     port_dd_ref = ft.Ref[ft.Dropdown]()
     conn_btn_text_ref = ft.Ref[ft.Text]()
@@ -197,7 +198,6 @@ def main(page: ft.Page):
         page.update()
 
     def parse_telemetry(line: str):
-        # Пример: STAT:DOOR=1,STATE=2,BAT=3.95
         if line.startswith("LOG:"):
             add_event(line[4:].strip())
             return
@@ -205,19 +205,41 @@ def main(page: ft.Page):
             return
         try:
             params = dict(item.split("=") for item in line[5:].split(","))
+
+            # --- Обработка двери ---
             if "DOOR" in params:
                 new_open = params["DOOR"] == "1"
                 if new_open != demo_state["door_open"]:
                     apply_door_state(new_open)
+
+            # --- Синхронизация статуса охраны (от физической кнопки) ---
+            if "STATE" in params:
+                is_armed = params["STATE"] != "0"
+                if is_armed != demo_state["armed"]:
+                    demo_state["armed"] = is_armed
+                    if is_armed:
+                        arm_btn_text_ref.current.value = "СНЯТЬ С ОХРАНЫ"
+                        arm_btn_icon_ref.current.name = ft.Icons.SHIELD_OUTLINED
+                    else:
+                        arm_btn_text_ref.current.value = "ПОСТАВИТЬ НА ОХРАНУ"
+                        arm_btn_icon_ref.current.name = ft.Icons.SHIELD_MOON
+                    page.update()
+
+            # --- Батарея ---
             if "BAT" in params and battery_bar_ref.current and battery_text_ref.current:
                 v = float(params["BAT"])
                 pct = max(0, min(100, int((v - 3.0) / (4.2 - 3.0) * 100)))
                 battery_bar_ref.current.value = pct / 100
                 battery_text_ref.current.value = f"{pct}% ({v:.2f} V)"
-                page.update()
-        except Exception:
-            pass
 
+            # --- Датчик света ---
+            if "LIGHT" in params and light_text_ref.current:
+                light_val = int(params["LIGHT"])
+                light_text_ref.current.value = f"{light_val}%"
+
+            page.update()
+        except Exception as e:
+            print(f"Ошибка парсинга: {e}")
     def on_notify(_, data: bytearray):
         # Данные приходят кусками по ~20 байт — склеиваем до символа конца строки
         conn["buf"] += conn["decoder"].decode(bytes(data))
@@ -610,15 +632,25 @@ def main(page: ft.Page):
         border_radius=16,
         padding=16,
         content=ft.Column([
+            # Батарея
             ft.Row([
                 ft.Row([
                     ft.Icon(ft.Icons.BATTERY_CHARGING_FULL_ROUNDED, color=theme.WARNING, size=18),
-                    ft.Text("Питание устройства", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT)
+                    ft.Text("Питание", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT)
                 ]),
-                ft.Text(ref=battery_text_ref, value="Ожидание данных...", size=12, color=theme.MUTED_TEXT)
+                ft.Text(ref=battery_text_ref, value="Ожидание...", size=12, color=theme.MUTED_TEXT)
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             ft.ProgressBar(ref=battery_bar_ref, value=0.0, color=theme.WARNING,
-                           bgcolor=theme.INPUT_BG, bar_height=6)
+                           bgcolor=theme.INPUT_BG, bar_height=6),
+
+            # Свет
+            ft.Row([
+                ft.Row([
+                    ft.Icon(ft.Icons.LIGHT_MODE_ROUNDED, color=ft.Colors.YELLOW_600, size=18),
+                    ft.Text("Уровень освещения", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT)
+                ]),
+                ft.Text(ref=light_text_ref, value="0%", size=14, weight=ft.FontWeight.BOLD, color=theme.TEXT)
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ], spacing=10)
     )
 
