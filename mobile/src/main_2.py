@@ -1,790 +1,519 @@
-import flet as ft
-import datetime
+import asyncio
+import base64
 import csv
 import io
-import codecs
-import theme
+import os
+import time
+from datetime import datetime
+
+import aiohttp
+import flet as ft
 from bleak import BleakClient, BleakScanner
 
-# ==================== BLE-ПРОФИЛЬ (должен совпадать с прошивкой ESP32) ====================
-DEVICE_NAME = "DoorGuardian"
-SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-TX_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"  # ESP32 -> приложение (notify)
-RX_CHAR_UUID = "6d68efe5-04b6-4a85-abc4-c2670b7bf7fd"  # приложение -> ESP32 (write)
+# =========================================================================
+# КОНФИГУРАЦИЯ СИСТЕМЫ ПО УМОЛЧАНИЮ
+# =========================================================================
+DEFAULT_CAMERA_IP = "192.168.1.100"
+BLE_SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+BLE_CHAR_TX_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"  # NOTIFY
+BLE_CHAR_RX_UUID = "6d68efe5-04b6-4a85-abc4-c2670b7bf7fd"  # WRITE
+
+DEFAULT_PHONE_PREFIX = "+7"
+DEFAULT_PHONE_NUMBER = "9991234567"
+DEFAULT_ALARM_DELAY_SEC = 3
 
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def make_border(color: str, width: float = 1.0) -> ft.Border:
-    side = ft.BorderSide(width, color)
-    return ft.Border(top=side, bottom=side, left=side, right=side)
-
-
-def make_padding(horizontal: float, vertical: float) -> ft.Padding:
-    return ft.Padding(horizontal, vertical, horizontal, vertical)
-
-
-def main(page: ft.Page):
-    page.title = "DoorGuardian"
+async def main(page: ft.Page):
+    page.title = "Охранный комплекс: DoorGuardian & FPV Turret"
     page.theme_mode = ft.ThemeMode.DARK
-    page.bgcolor = theme.BACKGROUND
-    page.padding = 20
+    page.padding = 16
+    page.spacing = 16
     page.scroll = ft.ScrollMode.ADAPTIVE
-    page.window_width = 400
-    page.window_height = 800
 
-    page.theme = ft.Theme(
-        color_scheme=ft.ColorScheme(
-            primary=theme.PRIMARY,
-            surface=theme.CARD,
-            surface_tint=ft.Colors.TRANSPARENT,
-        )
-    )
-
-    # ---------- Состояние ----------
-    demo_state = {"door_open": False, "armed": False}
-    # Настройки, которые меняются через окно «Настройки»
-    config = {
-        "prefix": "+7",     # неизменяемый префикс номера (меняется только в настройках)
-        "delay_min": 5,     # мин. значение ползунка
-        "delay_max": 60,    # макс. значение ползунка
+    # --- СОСТОЯНИЕ ПРИЛОЖЕНИЯ ---
+    state = {
+        "camera_ip": DEFAULT_CAMERA_IP,
+        "phone_prefix": DEFAULT_PHONE_PREFIX,
+        "phone_number": DEFAULT_PHONE_NUMBER,
+        "alarm_delay": DEFAULT_ALARM_DELAY_SEC,
+        "door_open": False,
+        "alarm_active": False,
+        "ble_connected": False,
+        "camera_streaming": False,
+        "head_distance": -1,
+        "head_light": 0,
+        "head_pan": 165,
+        "head_tilt": 125,
+        "ptz_holding": False,
+        "ptz_active_cmd": None,
     }
-    conn = {
-        "client": None,
-        "buf": "",
-        "busy": False,
-        # инкрементальный декодер: кириллица из LOG-строк может разорваться между BLE-пакетами
-        "decoder": codecs.getincrementaldecoder("utf-8")(errors="ignore"),
-    }
-    log_data = []
 
-    # ==================== REFS ====================
-    door_title_ref = ft.Ref[ft.Text]()
-    door_subtitle_ref = ft.Ref[ft.Text]()
-    door_icon_ref = ft.Ref[ft.Icon]()
-    status_card_ref = ft.Ref[ft.Container]()
+    ble_client: BleakClient = None
+    event_log_data = []
 
-    arm_btn_text_ref = ft.Ref[ft.Text]()
-    arm_btn_icon_ref = ft.Ref[ft.Icon]()
-
-    battery_text_ref = ft.Ref[ft.Text]()
-    battery_bar_ref = ft.Ref[ft.ProgressBar]()
-    light_text_ref = ft.Ref[ft.Text]()
-
-    port_dd_ref = ft.Ref[ft.Dropdown]()
-    conn_btn_text_ref = ft.Ref[ft.Text]()
-    conn_btn_ref = ft.Ref[ft.Container]()
-    conn_badge_text_ref = ft.Ref[ft.Text]()
-    conn_badge_ref = ft.Ref[ft.Container]()
-
-    prefix_text_ref = ft.Ref[ft.Text]()
-    phone_field_ref = ft.Ref[ft.TextField]()
-    sound_delay_ref = ft.Ref[ft.Slider]()
-    sound_delay_text_ref = ft.Ref[ft.Text]()
-    event_log_ref = ft.Ref[ft.Column]()
-
-    # ==================== ЖУРНАЛ ====================
-    def add_event(message: str):
-        if not event_log_ref.current:
-            return
-
-        now = datetime.datetime.now()
-        log_data.append([now.strftime("%Y-%m-%d %H:%M:%S"), message])
-
-        event_log_ref.current.controls.insert(
-            0,
-            ft.Container(
-                content=ft.Row([
-                    ft.Container(
-                        content=ft.Text(now.strftime("%H:%M:%S"), size=11, color=theme.MUTED_TEXT,
-                                        weight=ft.FontWeight.W_500),
-                        bgcolor=theme.BACKGROUND,
-                        padding=make_padding(8, 4),
-                        border_radius=6,
-                    ),
-                    ft.Text(message, size=13, color=theme.TEXT, weight=ft.FontWeight.W_400, expand=True),
-                ], alignment=ft.MainAxisAlignment.START),
-                padding=make_padding(0, 3),
-            )
-        )
-        if len(event_log_ref.current.controls) > 50:
-            event_log_ref.current.controls.pop()
-
+    # =========================================================================
+    # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ЛОГИРОВАНИЯ И ЭКСПОРТА
+    # =========================================================================
+    def add_log_event(event_type: str, details: str):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        event_log_data.insert(0, {
+            "time": now_str,
+            "type": event_type,
+            "details": details,
+            "distance": f"{state['head_distance']} см",
+            "light": f"{state['head_light']}"
+        })
+        # Обновление таблицы в UI
+        rows = []
+        for item in event_log_data[:25]:
+            color = ft.colors.RED_400 if "ТРЕВОГА" in item["type"] else ft.colors.WHITE
+            rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(item["time"], size=12)),
+                ft.DataCell(ft.Text(item["type"], color=color, weight=ft.FontWeight.BOLD, size=12)),
+                ft.DataCell(ft.Text(item["details"], size=12)),
+                ft.DataCell(ft.Text(item["distance"], size=12)),
+                ft.DataCell(ft.Text(item["light"], size=12)),
+            ]))
+        log_table.rows = rows
         page.update()
 
-    def show_snack(text: str):
-        page.show_dialog(
-            ft.SnackBar(content=ft.Text(text, color=theme.TEXT), bgcolor=theme.CARD)
+    def export_csv(e):
+        if not event_log_data:
+            page.snack_bar = ft.SnackBar(ft.Text("Журнал событий пуст!"), bgcolor=ft.colors.ORANGE_800)
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        filename = f"security_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(filename, mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=["time", "type", "details", "distance", "light"])
+            writer.writeheader()
+            writer.writerows(event_log_data)
+
+        page.snack_bar = ft.SnackBar(
+            ft.Text(f"Журнал успешно экспортирован в файл: {filename}"),
+            bgcolor=ft.colors.GREEN_800
         )
-
-    # ==================== ЭКСПОРТ CSV ====================
-    # FilePicker в Flet 1.0 — это сервис: регистрируется в page.services (не в overlay!)
-    file_picker = ft.FilePicker()
-    page.services.append(file_picker)
-
-    async def export_csv(e):
-        try:
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-            writer.writerow(["Timestamp", "Event"])
-            writer.writerows(log_data)
-            data = buf.getvalue().encode("utf-8-sig")  # BOM — чтобы Excel читал кириллицу
-
-            # На телефоне и в вебе файл записывает сам пикер, ему нужны байты.
-            # На десктопе пикер возвращает только путь — пишем файл сами.
-            is_mobile_or_web = page.web or page.platform in (
-                ft.PagePlatform.ANDROID, ft.PagePlatform.IOS
-            )
-
-            path = await file_picker.save_file(
-                dialog_title="Сохранить журнал событий",
-                file_name="door_log.csv",
-                allowed_extensions=["csv"],
-                src_bytes=data if is_mobile_or_web else None,
-            )
-
-            if not is_mobile_or_web and path:
-                with open(path, "wb") as f:
-                    f.write(data)
-
-            if path or is_mobile_or_web:
-                add_event("Журнал экспортирован")
-        except Exception as err:
-            add_event(f"Ошибка экспорта: {err}")
-
-    # ==================== BLUETOOTH (BLE) ====================
-    def is_connected() -> bool:
-        client = conn["client"]
-        return bool(client and client.is_connected)
-
-    async def _write_async(data: bytes):
-        client = conn["client"]
-        if not client:
-            return
-        try:
-            # BLE-пакет по умолчанию ~20 байт — режем команду на куски
-            for i in range(0, len(data), 20):
-                await client.write_gatt_char(RX_CHAR_UUID, data[i:i + 20], response=False)
-        except Exception as err:
-            add_event(f"Ошибка отправки: {err}")
-
-    def send_command(cmd: str) -> bool:
-        """Синхронная обёртка: ставит отправку в очередь event loop Flet."""
-        if not is_connected():
-            return False
-        page.run_task(_write_async, (cmd + "\n").encode())
-        return True
-
-    def apply_door_state(is_open: bool):
-        demo_state["door_open"] = is_open
-        if not (door_title_ref.current and door_subtitle_ref.current
-                and door_icon_ref.current and status_card_ref.current):
-            return
-        if is_open:
-            door_title_ref.current.value = "ДВЕРЬ ОТКРЫТА"
-            door_subtitle_ref.current.value = "Внимание: Зафиксирован проход"
-            door_icon_ref.current.name = ft.Icons.DOOR_SLIDING_OUTLINED
-            door_icon_ref.current.color = theme.DANGER
-            status_card_ref.current.bgcolor = theme.DANGER_BG
-            status_card_ref.current.border = make_border(theme.DANGER)
-            add_event("⚠️ Дверь открыта")
-        else:
-            door_title_ref.current.value = "ДВЕРЬ ЗАКРЫТА"
-            door_subtitle_ref.current.value = "Периметр защищен"
-            door_icon_ref.current.name = ft.Icons.DOOR_SLIDING
-            door_icon_ref.current.color = theme.SUCCESS
-            status_card_ref.current.bgcolor = theme.SUCCESS_BG
-            status_card_ref.current.border = make_border(theme.SUCCESS)
-            add_event("🔒 Дверь закрыта")
+        page.snack_bar.open = True
         page.update()
 
-    def parse_telemetry(line: str):
-        if line.startswith("LOG:"):
-            add_event(line[4:].strip())
-            return
-        if not line.startswith("STAT:"):
-            return
+    # =========================================================================
+    # СЕТЕВЫЕ ЗАПРОСЫ К ESP32-S3 (PTZ & ТЕЛЕМЕТРИЯ)
+    # =========================================================================
+    async def send_ptz_command(cmd: str):
+        url = f"http://{state['camera_ip']}/cmd?c={cmd}"
         try:
-            params = dict(item.split("=") for item in line[5:].split(","))
-
-            # --- Обработка двери ---
-            if "DOOR" in params:
-                new_open = params["DOOR"] == "1"
-                if new_open != demo_state["door_open"]:
-                    apply_door_state(new_open)
-
-            # --- Синхронизация статуса охраны (от физической кнопки) ---
-            if "STATE" in params:
-                is_armed = params["STATE"] != "0"
-                if is_armed != demo_state["armed"]:
-                    demo_state["armed"] = is_armed
-                    if is_armed:
-                        arm_btn_text_ref.current.value = "СНЯТЬ С ОХРАНЫ"
-                        arm_btn_icon_ref.current.name = ft.Icons.SHIELD_OUTLINED
-                    else:
-                        arm_btn_text_ref.current.value = "ПОСТАВИТЬ НА ОХРАНУ"
-                        arm_btn_icon_ref.current.name = ft.Icons.SHIELD_MOON
-                    page.update()
-
-            # --- Батарея ---
-            if "BAT" in params and battery_bar_ref.current and battery_text_ref.current:
-                v = float(params["BAT"])
-                pct = max(0, min(100, int((v - 3.0) / (4.2 - 3.0) * 100)))
-                battery_bar_ref.current.value = pct / 100
-                battery_text_ref.current.value = f"{pct}% ({v:.2f} V)"
-
-            # --- Датчик света ---
-            if "LIGHT" in params and light_text_ref.current:
-                light_val = int(params["LIGHT"])
-                light_text_ref.current.value = f"{light_val}%"
-
-            page.update()
-        except Exception as e:
-            print(f"Ошибка парсинга: {e}")
-    def on_notify(_, data: bytearray):
-        # Данные приходят кусками по ~20 байт — склеиваем до символа конца строки
-        conn["buf"] += conn["decoder"].decode(bytes(data))
-        while "\n" in conn["buf"]:
-            line, conn["buf"] = conn["buf"].split("\n", 1)
-            line = line.strip()
-            if line:
-                parse_telemetry(line)
-
-    def on_ble_disconnected(_client):
-        # Вызывается, если ESP32 пропала сама (выключили, ушла из зоны)
-        if conn["client"] is not None:
-            conn["client"] = None
-            conn["buf"] = ""
-            set_conn_ui(False)
-            page.update()
-            add_event("🔌 Связь потеряна")
-
-    def set_conn_ui(connected: bool, port_name: str = ""):
-        if connected:
-            conn_btn_text_ref.current.value = "Отключиться"
-            conn_btn_ref.current.bgcolor = theme.DANGER
-            conn_badge_text_ref.current.value = f"Online · {port_name}"
-            conn_badge_text_ref.current.color = theme.SUCCESS
-            conn_badge_ref.current.bgcolor = theme.SUCCESS_BG
-            conn_badge_ref.current.border = make_border(theme.SUCCESS)
-        else:
-            conn_btn_text_ref.current.value = "Подключиться"
-            conn_btn_ref.current.bgcolor = theme.SUCCESS
-            conn_badge_text_ref.current.value = "Offline"
-            conn_badge_text_ref.current.color = theme.DANGER
-            conn_badge_ref.current.bgcolor = theme.DANGER_BG
-            conn_badge_ref.current.border = make_border(theme.DANGER)
-
-    async def disconnect(silent: bool = True, reason: str = "Отключено от контроллера"):
-        client = conn["client"]
-        conn["client"] = None  # чтобы on_ble_disconnected не дублировал сообщение
-        conn["buf"] = ""
-        try:
-            if client and client.is_connected:
-                await client.disconnect()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=0.6) as resp:
+                    if resp.status == 200:
+                        pass
         except Exception:
             pass
-        set_conn_ui(False)
-        page.update()
-        if not silent:
-            add_event(f"🔌 {reason}")
 
-    async def connect(address: str, name: str):
-        conn["busy"] = True
-        conn_btn_text_ref.current.value = "Подключение..."
+    async def ptz_hold_worker():
+        """Непрерывное перемещение сервоприводов при удержании кнопки."""
+        while state["ptz_holding"] and state["ptz_active_cmd"]:
+            await send_ptz_command(state["ptz_active_cmd"])
+            await asyncio.sleep(0.12)
+
+    def on_ptz_down(cmd: str):
+        def handler(e):
+            state["ptz_holding"] = True
+            state["ptz_active_cmd"] = cmd
+            asyncio.create_task(ptz_hold_worker())
+
+        return handler
+
+    def on_ptz_up(e):
+        state["ptz_holding"] = False
+        state["ptz_active_cmd"] = None
+
+    async def telemetry_poll_task():
+        """Периодический опрос датчиков турели (дистанция, свет, углы)."""
+        while True:
+            if state["camera_streaming"] or state["camera_ip"]:
+                url = f"http://{state['camera_ip']}/telemetry"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=1.0) as resp:
+                            if resp.status == 200:
+                                text = await resp.text()
+                                # Разбор формата DIST=XX;LIGHT=YY;PAN=ZZ;TILT=WW
+                                parts = text.strip().split(";")
+                                for p in parts:
+                                    if "=" in p:
+                                        k, v = p.split("=", 1)
+                                        if k == "DIST":
+                                            state["head_distance"] = int(v)
+                                        elif k == "LIGHT":
+                                            state["head_light"] = int(v)
+                                        elif k == "PAN":
+                                            state["head_pan"] = int(v)
+                                        elif k == "TILT":
+                                            state["head_tilt"] = int(v)
+
+                                # Обновление плашек в UI
+                                dist_text = f"{state['head_distance']} см" if state['head_distance'] > 0 else "---"
+                                txt_head_dist.value = dist_text
+                                txt_head_light.value = f"{state['head_light']} ADC"
+                                txt_head_pos.value = f"Pan: {state['head_pan']}° | Tilt: {state['head_tilt']}°"
+                                page.update()
+                except Exception:
+                    pass
+            await asyncio.sleep(0.4)
+
+    # =========================================================================
+    # ВИДЕОПОТОК (MJPEG / SNAPSHOT STREAMER)
+    # =========================================================================
+    async def video_stream_task():
+        """Потоковый граббер кадров с камеры ESP32-S3."""
+        while True:
+            if state["camera_streaming"]:
+                url = f"http://{state['camera_ip']}/snapshot"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=1.2) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                b64 = base64.b64encode(data).decode("utf-8")
+                                camera_view.src_base64 = b64
+                                camera_view.visible = True
+                                camera_placeholder.visible = False
+                                page.update()
+                except Exception:
+                    pass
+            await asyncio.sleep(0.06)
+
+    def toggle_camera_stream(e):
+        state["camera_streaming"] = not state["camera_streaming"]
+        btn_stream.text = "Остановить видео" if state["camera_streaming"] else "Запустить видео"
+        btn_stream.icon = ft.icons.VIDEOCAM_OFF if state["camera_streaming"] else ft.icons.VIDEOCAM
+        btn_stream.bgcolor = ft.colors.RED_700 if state["camera_streaming"] else ft.colors.BLUE_700
+        if not state["camera_streaming"]:
+            camera_view.visible = False
+            camera_placeholder.visible = True
         page.update()
+
+    # =========================================================================
+    # BLUETOOTH LOW ENERGY (BLE) КЛИЕНТ
+    # =========================================================================
+    def ble_notification_handler(sender, data: bytearray):
+        raw = data.decode("utf-8", errors="ignore").strip()
+        # Парсинг: DOOR=1;ALARM=1;BTN=0
+        pairs = raw.split(";")
+        old_door = state["door_open"]
+        for pair in pairs:
+            if "=" in pair:
+                key, val = pair.split("=", 1)
+                val = val.strip()
+                if key == "DOOR":
+                    state["door_open"] = (val == "1")
+                elif key == "ALARM":
+                    state["alarm_active"] = (val == "1")
+                elif key == "BTN":
+                    if val == "1":
+                        add_log_event("КНОПКА", "Физическая кнопка двери нажата")
+
+        # СОБЫТИЕ ТРЕВОГИ: Дверь открыта (DOOR=1)
+        if state["door_open"] and not old_door:
+            add_log_event("ТРЕВОГА ДВЕРИ", "Геркон разомкнут! Открытие двери!")
+            card_door_status.bgcolor = ft.colors.RED_900
+            txt_door_status.value = "ДВЕРЬ ОТКРЫТА (ТРЕВОГА!)"
+            txt_door_status.color = ft.colors.RED_100
+
+            # 1. Автоматическое центрирование турели на дверь
+            asyncio.create_task(send_ptz_command("C"))
+            # 2. Автоматическое включение видеопотока
+            if not state["camera_streaming"]:
+                state["camera_streaming"] = True
+                btn_stream.text = "Остановить видео"
+                btn_stream.icon = ft.icons.VIDEOCAM_OFF
+                btn_stream.bgcolor = ft.colors.RED_700
+
+        elif not state["door_open"] and old_door:
+            add_log_event("НОРМА", "Дверь закрыта (геркон замкнут)")
+            card_door_status.bgcolor = ft.colors.GREEN_900
+            txt_door_status.value = "ДВЕРЬ ЗАКРЫТА"
+            txt_door_status.color = ft.colors.GREEN_100
+
+        # Статус сирены
+        badge_alarm.text = "СИРЕНА: ВКЛЮЧЕНА" if state["alarm_active"] else "СИРЕНА: ВЫКЛ"
+        badge_alarm.bgcolor = ft.colors.RED_600 if state["alarm_active"] else ft.colors.GREY_800
+        page.update()
+
+    async def ble_connect_task(e=None):
+        nonlocal ble_client
+        btn_ble_connect.disabled = True
+        btn_ble_connect.text = "Поиск DoorGuardian..."
+        page.update()
+
         try:
-            client = BleakClient(address, disconnected_callback=on_ble_disconnected)
-            await client.connect()
-            await client.start_notify(TX_CHAR_UUID, on_notify)
-            conn["client"] = client
-            set_conn_ui(True, name)
+            device = await BleakScanner.find_by_name("DoorGuardian", timeout=6.0)
+            if not device:
+                add_log_event("ОШИБКА BLE", "Устройство DoorGuardian не найдено в эфире")
+                btn_ble_connect.text = "Подключить BLE"
+                btn_ble_connect.disabled = False
+                page.update()
+                return
+
+            ble_client = BleakClient(device)
+            await ble_client.connect()
+            state["ble_connected"] = True
+
+            await ble_client.start_notify(BLE_CHAR_TX_UUID, ble_notification_handler)
+
+            add_log_event("СВЯЗЬ", "BLE подключен к DoorGuardian")
+            btn_ble_connect.text = "BLE Подключен"
+            btn_ble_connect.bgcolor = ft.colors.GREEN_700
+            btn_ble_connect.disabled = False
             page.update()
-            add_event(f"🔌 Подключено к {name}")
-            send_command("CMD:STATUS")  # запросить текущее состояние
-        except Exception as err:
-            set_conn_ui(False)
+        except Exception as ex:
+            add_log_event("ОШИБКА BLE", f"Сбой подключения: {str(ex)}")
+            btn_ble_connect.text = "Повторить BLE"
+            btn_ble_connect.bgcolor = ft.colors.RED_800
+            btn_ble_connect.disabled = False
+            state["ble_connected"] = False
             page.update()
-            add_event(f"Не удалось подключиться: {err}")
-            show_snack("Не удалось подключиться")
-        finally:
-            conn["busy"] = False
 
-    async def on_connect_click(e):
-        if conn["busy"]:
-            return
-        if is_connected():
-            await disconnect(silent=False)
-            return
-        dd = port_dd_ref.current
-        address = dd.value
-        if not address:
-            show_snack("Сначала найдите устройство (кнопка ⟳)")
-            return
-        name = next((o.text for o in dd.options if o.key == address), address)
-        await connect(address, name)
+    async def send_ble_command(cmd: str):
+        if ble_client and ble_client.is_connected:
+            try:
+                await ble_client.write_gatt_char(BLE_CHAR_RX_UUID, cmd.encode("utf-8"))
+            except Exception as ex:
+                add_log_event("ОШИБКА BLE", f"Не удалось передать команду: {str(ex)}")
 
-    async def refresh_ports(e=None):
-        """Сканирование BLE-устройств поблизости (~5 с)."""
-        if conn["busy"]:
-            return
-        conn["busy"] = True
-        add_event("🔍 Поиск Bluetooth-устройств...")
-        dd = port_dd_ref.current
-        try:
-            found = await BleakScanner.discover(timeout=5.0, return_adv=True)
-            devices = []
-            for address, (dev, adv) in found.items():
-                uuids = [u.lower() for u in (adv.service_uuids or [])]
-                ours = SERVICE_UUID in uuids or (dev.name or "").startswith(DEVICE_NAME)
-                if ours or dev.name:  # безымянные устройства не показываем
-                    devices.append((not ours, dev.name or "?", address, ours))
-            devices.sort()  # наши устройства — первыми
-
-            dd.options = [
-                ft.DropdownOption(
-                    key=address,
-                    text=f"{'🛡 ' if ours else ''}{name} · {address}",
-                )
-                for _, name, address, ours in devices
-            ]
-            keys = [d[2] for d in devices]
-            if dd.value not in keys:
-                dd.value = keys[0] if keys and devices[0][3] else None
-            page.update()
-            add_event(f"Найдено устройств: {len(devices)}")
-        except Exception as err:
-            add_event(f"Ошибка сканирования: {err}")
-        finally:
-            conn["busy"] = False
-
-    # ==================== ОБРАБОТЧИКИ UI ====================
-    def toggle_door(e):
-        # Тестовая кнопка: просто переключает отображение
-        apply_door_state(not demo_state["door_open"])
-
-    def toggle_guard(e):
-        demo_state["armed"] = not demo_state["armed"]
-        if demo_state["armed"]:
-            arm_btn_text_ref.current.value = "СНЯТЬ С ОХРАНЫ"
-            arm_btn_icon_ref.current.name = ft.Icons.SHIELD_OUTLINED
-            send_command("CMD:ARM")
-            add_event("🛡️ Система поставлена на охрану")
-        else:
-            arm_btn_text_ref.current.value = "ПОСТАВИТЬ НА ОХРАНУ"
-            arm_btn_icon_ref.current.name = ft.Icons.SHIELD_MOON
-            send_command("CMD:DISARM")
-            add_event("🔓 Система снята с охраны")
+    async def reset_alarm_click(e):
+        await send_ble_command("RESET")
+        state["alarm_active"] = False
+        badge_alarm.text = "СИРЕНА: ВЫКЛ"
+        badge_alarm.bgcolor = ft.colors.GREY_800
+        add_log_event("СБРОС", "Команда сброса тревоги отправлена")
         page.update()
 
-    def on_slider_change(e):
-        sound_delay_text_ref.current.value = f"{int(e.control.value)} сек"
-        page.update()
+    # =========================================================================
+    # ДИАЛОГ НАСТРОЕК (SETTINGS DIALOG)
+    # =========================================================================
+    tf_settings_ip = ft.TextField(label="IP-адрес ESP32-S3 Камеры", value=state["camera_ip"])
+    tf_settings_prefix = ft.TextField(label="Префикс страны", value=state["phone_prefix"], width=100)
+    tf_settings_phone = ft.TextField(label="Номер телефона для SMS", value=state["phone_number"], expand=True)
+    slider_delay = ft.Slider(min=1, max=15, divisions=14, label="{value} сек", value=state["alarm_delay"])
 
     def save_settings(e):
-        digits = (phone_field_ref.current.value or "").strip()
-        prefix_digits = len(config["prefix"]) - 1  # без '+'
-        need = 11 if config["prefix"] == "+7" else 7
-        need_digits = need - prefix_digits if config["prefix"] == "+7" else 7
+        state["camera_ip"] = tf_settings_ip.value.strip()
+        state["phone_prefix"] = tf_settings_prefix.value.strip()
+        state["phone_number"] = tf_settings_phone.value.strip()
+        state["alarm_delay"] = int(slider_delay.value)
+        settings_dialog.open = False
+        add_log_event("НАСТРОЙКИ", f"Конфигурация обновлена (IP: {state['camera_ip']})")
+        page.update()
 
-        if not digits.isdigit() or len(digits) < need_digits:
-            phone_field_ref.current.error_text = f"Минимум {need_digits} цифр"
-            page.update()
-            return
-
-        phone_field_ref.current.error_text = None
-        phone = config["prefix"] + digits
-        delay_val = int(sound_delay_ref.current.value)
-
-        send_command(f"SET:PHONE={phone},T1={delay_val}")
-        add_event(f"⚙️ Сохранено: {phone}, задержка {delay_val}с")
-        show_snack("Настройки применены")
-
-    # ==================== ОКНО НАСТРОЕК ====================
-    def apply_prefix_to_ui():
-        prefix_text_ref.current.value = config["prefix"]
-        # E.164: всего не больше 15 цифр
-        phone_field_ref.current.max_length = max(4, 15 - (len(config["prefix"]) - 1))
-
-    def apply_slider_range():
-        s = sound_delay_ref.current
-        s.min = config["delay_min"]
-        s.max = config["delay_max"]
-        s.divisions = config["delay_max"] - config["delay_min"]
-        s.value = max(s.min, min(s.max, s.value))
-        sound_delay_text_ref.current.value = f"{int(s.value)} сек"
+    settings_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Системные настройки комплекса"),
+        content=ft.Column([
+            tf_settings_ip,
+            ft.Row([tf_settings_prefix, tf_settings_phone]),
+            ft.Text("Задержка срабатывания тревоги:"),
+            slider_delay,
+        ], tight=True, spacing=12),
+        actions=[
+            ft.TextButton("Отмена", on_click=lambda e: setattr(settings_dialog, "open", False) or page.update()),
+            ft.ElevatedButton("Сохранить", on_click=save_settings, bgcolor=ft.colors.GREEN_700),
+        ],
+    )
+    page.dialog = settings_dialog
 
     def open_settings(e):
-        prefix_f = ft.TextField(
-            label="Начало номера (код страны)",
-            value=config["prefix"],
-            text_size=14,
-            bgcolor=theme.INPUT_BG,
-            max_length=5,
-            border=ft.OutlineInputBorder(border_radius=10, side=ft.BorderSide(1, theme.CARD_BORDER)),
-        )
-        min_f = ft.TextField(
-            label="Мин. задержка, сек",
-            value=str(config["delay_min"]),
-            text_size=14,
-            bgcolor=theme.INPUT_BG,
-            input_filter=ft.NumbersOnlyInputFilter(),
-            max_length=3,
-            expand=True,
-            border=ft.OutlineInputBorder(border_radius=10, side=ft.BorderSide(1, theme.CARD_BORDER)),
-        )
-        max_f = ft.TextField(
-            label="Макс. задержка, сек",
-            value=str(config["delay_max"]),
-            text_size=14,
-            bgcolor=theme.INPUT_BG,
-            input_filter=ft.NumbersOnlyInputFilter(),
-            max_length=3,
-            expand=True,
-            border=ft.OutlineInputBorder(border_radius=10, side=ft.BorderSide(1, theme.CARD_BORDER)),
-        )
+        tf_settings_ip.value = state["camera_ip"]
+        tf_settings_prefix.value = state["phone_prefix"]
+        tf_settings_phone.value = state["phone_number"]
+        slider_delay.value = state["alarm_delay"]
+        settings_dialog.open = True
+        page.update()
 
-        def close_dialog(_=None):
-            page.pop_dialog()
+    # =========================================================================
+    # ВИДЖЕТЫ ИНТЕРФЕЙСА (UI LAYOUT)
+    # =========================================================================
 
-        def apply_dialog(_=None):
-            pfx = (prefix_f.value or "").strip()
-            if not (pfx.startswith("+") and pfx[1:].isdigit() and 1 <= len(pfx[1:]) <= 4):
-                prefix_f.error_text = "Формат: +7, +380, +1 ..."
-                page.update()
-                return
-            prefix_f.error_text = None
-
-            try:
-                mn, mx = int(min_f.value), int(max_f.value)
-            except (TypeError, ValueError):
-                min_f.error_text = "Число"
-                page.update()
-                return
-            if mn < 1 or mx <= mn:
-                max_f.error_text = "Макс. должно быть больше мин."
-                page.update()
-                return
-
-            config["prefix"] = pfx
-            config["delay_min"], config["delay_max"] = mn, mx
-            apply_prefix_to_ui()
-            apply_slider_range()
-            page.pop_dialog()
-            add_event(f"⚙️ Префикс {pfx}, диапазон {mn}–{mx} сек")
-
-        dlg = ft.AlertDialog(
-            modal=True,
-            bgcolor=theme.CARD,
-            title=ft.Text("Настройки", color=theme.TEXT, weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                width=320,
-                content=ft.Column([
-                    ft.Text("Начало номера телефона", size=12, color=theme.MUTED_TEXT),
-                    prefix_f,
-                    ft.Text("Диапазон ползунка задержки", size=12, color=theme.MUTED_TEXT),
-                    ft.Row([min_f, max_f], spacing=10),
-                ], spacing=10, tight=True),
-            ),
-            actions=[
-                ft.TextButton("Отмена", on_click=close_dialog,
-                              style=ft.ButtonStyle(color=theme.MUTED_TEXT)),
-                ft.TextButton("Применить", on_click=apply_dialog,
-                              style=ft.ButtonStyle(color=theme.PRIMARY)),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        page.show_dialog(dlg)
-
-    # ==================== ЭЛЕМЕНТЫ ИНТЕРФЕЙСА ====================
-
-    # --- Шапка (с кнопкой настроек) ---
-    header = ft.Row([
+    # 1. Шапка
+    header_row = ft.Row([
         ft.Row([
-            ft.Container(
-                content=ft.Icon(ft.Icons.SECURITY_ROUNDED, color=theme.PRIMARY, size=22),
-                bgcolor=theme.CARD,
-                padding=10,
-                border_radius=12,
-                border=make_border(theme.CARD_BORDER)
-            ),
-            ft.Column([
-                ft.Text("DoorGuardian", size=18, weight=ft.FontWeight.BOLD, color=theme.TEXT),
-                ft.Text("Панель управления Arduino", size=12, color=theme.MUTED_TEXT),
-            ], spacing=0)
+            ft.Icon(ft.icons.SECURITY, size=32, color=ft.colors.BLUE_400),
+            ft.Text("DoorGuardian & FPV Turret Core", size=22, weight=ft.FontWeight.BOLD),
         ]),
-        ft.IconButton(
-            icon=ft.Icons.SETTINGS_ROUNDED,
-            icon_color=theme.MUTED_TEXT,
-            tooltip="Настройки",
-            on_click=open_settings,
-        )
+        ft.Row([
+            ft.IconButton(ft.icons.SETTINGS, on_click=open_settings, tooltip="Настройки"),
+            ft.ElevatedButton("Экспорт CSV", icon=ft.icons.DOWNLOAD, on_click=export_csv),
+        ])
     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
 
-    # --- Подключение к COM-порту ---
-    port_dropdown = ft.Dropdown(
-        ref=port_dd_ref,
-        label="Bluetooth-устройство",
-        hint_text="Нажмите ⟳ для поиска",
-        options=[],
-        expand=True,
-        text_size=14,
-        color=theme.TEXT,
-        bgcolor=theme.INPUT_BG,
+    # 2. Карточка статуса двери и сирены
+    txt_door_status = ft.Text("ДВЕРЬ: ОЖИДАНИЕ СВЯЗИ", size=18, weight=ft.FontWeight.BOLD)
+    card_door_status = ft.Container(
+        content=ft.Row([
+            txt_door_status,
+            ft.Row([
+                badge_alarm := ft.Container(
+                    content=ft.Text("СИРЕНА: ВЫКЛ", weight=ft.FontWeight.BOLD),
+                    bgcolor=ft.colors.GREY_800,
+                    padding=8,
+                    border_radius=6
+                ),
+                btn_ble_connect := ft.ElevatedButton("Подключить BLE", icon=ft.icons.BLUETOOTH,
+                                                     on_click=ble_connect_task),
+                ft.ElevatedButton("Сброс сирены", icon=ft.icons.ALARM_OFF, bgcolor=ft.colors.ORANGE_800,
+                                  on_click=reset_alarm_click),
+            ], spacing=8)
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        bgcolor=ft.colors.GREY_900,
+        padding=16,
         border_radius=10,
-        border_color=theme.CARD_BORDER,
-        focused_border_color=theme.PRIMARY,
     )
 
-    connection_card = ft.Container(
-        bgcolor=theme.CARD,
-        border=make_border(theme.CARD_BORDER),
-        border_radius=16,
-        padding=16,
+    # 3. Карточка видеопотока FPV и Телеметрии
+    camera_placeholder = ft.Container(
         content=ft.Column([
-            ft.Row([
-                ft.Row([
-                    ft.Icon(ft.Icons.BLUETOOTH_ROUNDED, color=theme.PRIMARY, size=18),
-                    ft.Text("Подключение", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT),
-                ]),
-                ft.Container(
-                    ref=conn_badge_ref,
-                    content=ft.Text(ref=conn_badge_text_ref, value="Offline", size=11,
-                                    color=theme.DANGER, weight=ft.FontWeight.W_600),
-                    bgcolor=theme.DANGER_BG,
-                    padding=make_padding(10, 6),
-                    border_radius=20,
-                    border=make_border(theme.DANGER),
-                ),
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Row([
-                port_dropdown,
-                ft.IconButton(
-                    icon=ft.Icons.REFRESH_ROUNDED,
-                    icon_color=theme.PRIMARY,
-                    tooltip="Найти устройства",
-                    on_click=refresh_ports,
-                ),
-            ], spacing=4),
-            ft.Container(
-                ref=conn_btn_ref,
-                content=ft.Text(ref=conn_btn_text_ref, value="Подключиться",
-                                weight=ft.FontWeight.BOLD, color=theme.BACKGROUND,
-                                text_align=ft.TextAlign.CENTER),
-                bgcolor=theme.SUCCESS,
-                border_radius=10,
-                padding=14,
-                alignment=ft.Alignment.CENTER,
-                on_click=on_connect_click,
-                ink=True,
-            ),
-        ], spacing=12)
+            ft.Icon(ft.icons.VIDEOCAM_OFF, size=64, color=ft.colors.GREY_600),
+            ft.Text("Видеопоток выключен", color=ft.colors.GREY_400),
+        ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        width=480,
+        height=320,
+        bgcolor=ft.colors.BLACK45,
+        border_radius=8,
+        alignment=ft.alignment.center
     )
+    camera_view = ft.Image(width=480, height=320, fit=ft.ImageFit.CONTAIN, visible=False, border_radius=8)
 
-    # --- Карточка статуса двери ---
-    door_icon = ft.Icon(ft.Icons.DOOR_SLIDING, color=theme.SUCCESS, size=36, ref=door_icon_ref)
+    txt_head_dist = ft.Text("---", size=16, weight=ft.FontWeight.BOLD)
+    txt_head_light = ft.Text("---", size=16, weight=ft.FontWeight.BOLD)
+    txt_head_pos = ft.Text("Pan: 165° | Tilt: 125°", size=16, weight=ft.FontWeight.BOLD)
 
-    status_card = ft.Container(
-        ref=status_card_ref,
-        bgcolor=theme.SUCCESS_BG,
-        border=make_border(theme.SUCCESS),
-        border_radius=16,
-        padding=20,
-        content=ft.Row([
-            ft.Row([
-                door_icon,
-                ft.Column([
-                    ft.Text(ref=door_title_ref, value="ДВЕРЬ ЗАКРЫТА", size=17,
-                            weight=ft.FontWeight.BOLD, color=theme.TEXT),
-                    ft.Text(ref=door_subtitle_ref, value="Периметр защищен", size=13,
-                            color=theme.MUTED_TEXT),
-                ], spacing=2)
-            ]),
-            ft.IconButton(
-                icon=ft.Icons.SYNC_ROUNDED,
-                icon_color=theme.TEXT,
-                tooltip="Тест переключения двери",
-                on_click=toggle_door
-            )
-        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-    )
-
-    # --- Кнопка охраны ---
-    arm_btn_icon = ft.Icon(ft.Icons.SHIELD_MOON, color=theme.PRIMARY, size=20, ref=arm_btn_icon_ref)
-
-    arm_button = ft.Container(
-        content=ft.Row([
-            arm_btn_icon,
-            ft.Text(ref=arm_btn_text_ref, value="ПОСТАВИТЬ НА ОХРАНУ",
-                    weight=ft.FontWeight.BOLD, color=theme.TEXT),
-        ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
-        bgcolor=theme.CARD,
-        border=make_border(theme.PRIMARY),
-        border_radius=12,
-        padding=16,
-        on_click=toggle_guard,
-        ink=True
-    )
-
-    # --- Аккумулятор ---
-    battery_card = ft.Container(
-        bgcolor=theme.CARD,
-        border=make_border(theme.CARD_BORDER),
-        border_radius=16,
-        padding=16,
-        content=ft.Column([
-            # Батарея
-            ft.Row([
-                ft.Row([
-                    ft.Icon(ft.Icons.BATTERY_CHARGING_FULL_ROUNDED, color=theme.WARNING, size=18),
-                    ft.Text("Питание", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT)
-                ]),
-                ft.Text(ref=battery_text_ref, value="Ожидание...", size=12, color=theme.MUTED_TEXT)
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.ProgressBar(ref=battery_bar_ref, value=0.0, color=theme.WARNING,
-                           bgcolor=theme.INPUT_BG, bar_height=6),
-
-            # Свет
-            ft.Row([
-                ft.Row([
-                    ft.Icon(ft.Icons.LIGHT_MODE_ROUNDED, color=ft.Colors.YELLOW_600, size=18),
-                    ft.Text("Уровень освещения", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT)
-                ]),
-                ft.Text(ref=light_text_ref, value="0%", size=14, weight=ft.FontWeight.BOLD, color=theme.TEXT)
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-        ], spacing=10)
-    )
-
-    # --- Телефон: неизменяемый префикс + ввод остальных цифр ---
-    phone_row = ft.Row([
-        ft.Container(
-            content=ft.Row([
-                ft.Icon(ft.Icons.PHONE_ANDROID_ROUNDED, size=18, color=theme.MUTED_TEXT),
-                ft.Text(ref=prefix_text_ref, value=config["prefix"], size=15,
-                        weight=ft.FontWeight.BOLD, color=theme.TEXT),
-            ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
-            bgcolor=theme.INPUT_BG,
-            border=make_border(theme.CARD_BORDER),
-            border_radius=10,
-            padding=make_padding(12, 14),
+    telemetry_column = ft.Column([
+        ft.Text("Датчики Турели (Голова)", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.BLUE_200),
+        ft.Row([ft.Text("Дистанция (HC-SR04):", width=180), txt_head_dist]),
+        ft.Row([ft.Text("Освещенность (A0):", width=180), txt_head_light]),
+        ft.Row([ft.Text("Углы сервоприводов:", width=180), txt_head_pos]),
+        ft.Divider(),
+        btn_stream := ft.ElevatedButton(
+            "Запустить видео",
+            icon=ft.icons.VIDEOCAM,
+            bgcolor=ft.colors.BLUE_700,
+            on_click=toggle_camera_stream
         ),
-        ft.TextField(
-            ref=phone_field_ref,
-            label="Номер телефона для SMS",
-            hint_text="9991234567",
-            value="",
-            expand=True,
-            text_size=14,
-            bgcolor=theme.INPUT_BG,
-            keyboard_type=ft.KeyboardType.PHONE,
-            input_filter=ft.NumbersOnlyInputFilter(),
-            max_length=10,
-            border=ft.OutlineInputBorder(
-                border_radius=10,
-                side=ft.BorderSide(1, theme.CARD_BORDER)
-            )
-        ),
-    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START)
+    ], spacing=10)
 
-    settings_card = ft.Container(
-        bgcolor=theme.CARD,
-        border=make_border(theme.CARD_BORDER),
-        border_radius=16,
-        padding=16,
-        content=ft.Column([
-            ft.Text("Оповещения и таймеры", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT),
-            phone_row,
+    fpv_card = ft.Container(
+        content=ft.Row([
             ft.Column([
-                ft.Row([
-                    ft.Text("Задержка срабатывания", size=13, color=theme.MUTED_TEXT),
-                    ft.Text(ref=sound_delay_text_ref, value="15 сек", size=13,
-                            weight=ft.FontWeight.BOLD, color=theme.PRIMARY)
-                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                ft.Slider(
-                    ref=sound_delay_ref,
-                    min=config["delay_min"],
-                    max=config["delay_max"],
-                    divisions=config["delay_max"] - config["delay_min"],
-                    value=15,
-                    active_color=theme.PRIMARY,
-                    inactive_color=theme.INPUT_BG,
-                    on_change=on_slider_change
-                ),
-            ], spacing=2),
-            ft.Container(
-                content=ft.Text("Сохранить параметры", weight=ft.FontWeight.BOLD,
-                                color=theme.BACKGROUND, text_align=ft.TextAlign.CENTER),
-                bgcolor=theme.PRIMARY,
-                border_radius=10,
-                padding=14,
-                alignment=ft.Alignment.CENTER,
-                on_click=save_settings,
-                ink=True
-            )
-        ], spacing=14)
+                ft.Stack([camera_placeholder, camera_view]),
+            ]),
+            telemetry_column
+        ], spacing=20, alignment=ft.MainAxisAlignment.START),
+        bgcolor=ft.colors.GREY_900,
+        padding=16,
+        border_radius=10,
     )
 
-    # --- Журнал ---
-    event_log = ft.Column(ref=event_log_ref, spacing=4, scroll=ft.ScrollMode.AUTO)
+    # 4. Пульт управления PTZ (Инверсия Tilt + Hold)
+    def ptz_btn(icon, cmd, tooltip):
+        btn = ft.Container(
+            content=ft.Icon(icon, size=28, color=ft.colors.WHITE),
+            width=54,
+            height=54,
+            bgcolor=ft.colors.BLUE_GREY_800,
+            border_radius=8,
+            alignment=ft.alignment.center,
+            tooltip=tooltip,
+            on_click=lambda e: asyncio.create_task(send_ptz_command(cmd)),
+        )
+        return btn
+
+    ptz_pad = ft.Container(
+        content=ft.Column([
+            ft.Text("Управление Турелью (PTZ)", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.BLUE_200),
+            ft.Row([
+                ft.Container(width=54),
+                ptz_btn(ft.icons.ARROW_UPWARD, "U", "Наклон вверх (D11 уменьшить)"),
+                ft.Container(width=54),
+            ], alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([
+                ptz_btn(ft.icons.ARROW_BACK, "L", "Поворот влево (D10)"),
+                ptz_btn(ft.icons.CENTER_FOCUS_STRONG, "C", "Центрировать (165°/125°)"),
+                ptz_btn(ft.icons.ARROW_FORWARD, "R", "Поворот вправо (D10)"),
+            ], alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([
+                ft.Container(width=54),
+                ptz_btn(ft.icons.ARROW_DOWNWARD, "D", "Наклон вниз (D11 увеличить)"),
+                ft.Container(width=54),
+            ], alignment=ft.MainAxisAlignment.CENTER),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+        bgcolor=ft.colors.GREY_900,
+        padding=16,
+        border_radius=10,
+        width=280
+    )
+
+    # 5. Карточка SMS-модуля
+    tf_test_sms = ft.TextField(label="Текст тревожного SMS", value="ВНИМАНИЕ! Сработала сигнализация двери!",
+                               multiline=True, min_lines=2)
+    sms_card = ft.Container(
+        content=ft.Column([
+            ft.Text("Модуль SMS-оповещений", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.BLUE_200),
+            tf_test_sms,
+            ft.ElevatedButton(
+                "Отправить тестовое SMS",
+                icon=ft.icons.SMS,
+                bgcolor=ft.colors.INDIGO_700,
+                on_click=lambda e: add_log_event("SMS",
+                                                 f"Отправка на {state['phone_prefix']}{state['phone_number']}: {tf_test_sms.value}")
+            )
+        ], spacing=10),
+        bgcolor=ft.colors.GREY_900,
+        padding=16,
+        border_radius=10,
+        expand=True
+    )
+
+    # 6. Журнал событий (Таблица)
+    log_table = ft.DataTable(
+        columns=[
+            ft.DataColumn(ft.Text("Время", weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Событие", weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Детали", weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Дистанция", weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Свет", weight=ft.FontWeight.BOLD)),
+        ],
+        rows=[],
+        border=ft.border.all(1, ft.colors.GREY_800),
+        heading_row_color=ft.colors.GREY_800,
+    )
 
     log_card = ft.Container(
-        bgcolor=theme.CARD,
-        border=make_border(theme.CARD_BORDER),
-        border_radius=16,
-        padding=16,
         content=ft.Column([
-            ft.Row([
-                ft.Row([
-                    ft.Icon(ft.Icons.RECEIPT_LONG_ROUNDED, color=theme.MUTED_TEXT, size=18),
-                    ft.Text("Журнал событий", size=14, weight=ft.FontWeight.W_600, color=theme.TEXT),
-                ]),
-                ft.Container(
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.DOWNLOAD_ROUNDED, size=14, color=theme.PRIMARY),
-                        ft.Text("CSV Экспорт", size=12, color=theme.PRIMARY, weight=ft.FontWeight.BOLD)
-                    ], spacing=4),
-                    on_click=export_csv,
-                    padding=make_padding(8, 4),
-                    border_radius=6,
-                    ink=True
-                )
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Container(
-                content=event_log,
-                height=140,
-                bgcolor=theme.INPUT_BG,
-                border_radius=10,
-                padding=10,
-                border=make_border(theme.CARD_BORDER, 0.5),
-                clip_behavior=ft.ClipBehavior.HARD_EDGE
-            )
-        ], spacing=10)
+            ft.Text("Журнал безопасности и событий в реальном времени", size=16, weight=ft.FontWeight.BOLD,
+                    color=ft.colors.BLUE_200),
+            log_table,
+        ], scroll=ft.ScrollMode.ADAPTIVE),
+        bgcolor=ft.colors.GREY_900,
+        padding=16,
+        border_radius=10,
     )
 
-    # ==================== СБОРКА СТРАНИЦЫ ====================
-    async def on_close(e):
-        await disconnect(silent=True)
-
-    page.on_close = on_close
-
+    # Сборка страницы
     page.add(
-        ft.Column(
-            controls=[
-                header,
-                connection_card,
-                status_card,
-                arm_button,
-                battery_card,
-                settings_card,
-                log_card
-            ],
-            spacing=16,
-            expand=True,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER
-        )
+        header_row,
+        card_door_status,
+        fpv_card,
+        ft.Row([ptz_pad, sms_card], alignment=ft.MainAxisAlignment.START,
+               vertical_alignment=ft.CrossAxisAlignment.START),
+        log_card
     )
 
-    add_event("Приложение успешно запущено")
+    # Старт фоновых асинхронных задач
+    asyncio.create_task(video_stream_task())
+    asyncio.create_task(telemetry_poll_task())
+    add_log_event("СИСТЕМА", "Центральный пульт инициализирован. Готов к работе.")
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    ft.app(target=main)

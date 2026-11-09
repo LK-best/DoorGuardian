@@ -1,182 +1,157 @@
 #include <Servo.h>
-#include <IRremote.hpp>
 #include <EEPROM.h>
+#include <IRremote.hpp>
 
-#define IR_PIN        A4    
-#define LIGHT_AO_PIN  A0    
-#define LIGHT_DO_PIN  A5    
-#define TRIG_PIN      12    
-#define ECHO_PIN      13    
+// --- ПИНЫ ---
+#define SERVO_PAN_PIN   10
+#define SERVO_TILT_PIN  11
+#define TRIG_PIN        12
+#define ECHO_PIN        13
+#define LIGHT_AO_PIN    A0
+#define LIGHT_DO_PIN    A5
+#define IR_PIN          A4
 
-#define EEPROM_ADDR_10 0 
-#define EEPROM_ADDR_11 2 
+// --- КАЛИБРОВКА СЕРВОПРИВОДОВ ---
+// Горизонт (Pan): механический сектор 150° - 181°, центр 165°, софтовый лимит 300
+#define PAN_MIN         150
+#define PAN_MAX         181
+#define PAN_CENTER      165
+#define PAN_LIMIT_MAX   300
 
-Servo servo10; 
-Servo servo11; 
+// Вертикаль (Tilt): сектор 85° - 165°, центр 125°
+#define TILT_MIN        85
+#define TILT_MAX        165
+#define TILT_CENTER     125
 
-int angle10; 
-int angle11; 
+#define STEP_ANGLE      6
 
-int dir10 = 0;
-int dir11 = 0;
-uint16_t activeCommand = 0;
+Servo servoPan;
+Servo servoTilt;
 
-unsigned long lastIRTime = 0;     
-unsigned long lastStepTime = 0;   
-unsigned long lastSaveTime = 0;   
-unsigned long lastSensorPrintTime = 0; 
-bool needSave = false;
+int currentPan = PAN_CENTER;
+int currentTilt = TILT_CENTER;
 
-const int MOVE_INTERVAL = 35; 
+unsigned long lastTelemetryTime = 0;
+const unsigned long TELEMETRY_INTERVAL = 250; // Отправка телеметрии каждые 250 мс
 
-void setAngle(Servo &s, int angle) {
-  int us = map(angle, 0, 180, 544, 2400);
-  s.writeMicroseconds(us);
+void loadFromEEPROM() {
+  EEPROM.get(0, currentPan);
+  EEPROM.get(2, currentTilt);
+  if (currentPan < PAN_MIN || currentPan > PAN_LIMIT_MAX) currentPan = PAN_CENTER;
+  if (currentTilt < TILT_MIN || currentTilt > TILT_MAX) currentTilt = TILT_CENTER;
 }
 
-long getDistance() {
+void saveToEEPROM() {
+  EEPROM.put(0, currentPan);
+  EEPROM.put(2, currentTilt);
+}
+
+void updateServos() {
+  servoPan.write(currentPan);
+  servoTilt.write(currentTilt);
+}
+
+long readDistanceCM() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(4);
+  delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
-  if (duration == 0) return -1;
-  return duration * 0.034 / 2;
-}
-
-// СТРОГАЯ ФИЛЬТРАЦИЯ КОМАНД ОТ ESP32
-void processESPCommand(char c) {
-  bool changed = false;
-
-  switch (c) {
-    case 'U': case 'u': // ВВЕРХ
-      angle11 -= 6;
-      changed = true;
-      break;
-    case 'D': case 'd': // ВНИЗ
-      angle11 += 6;
-      changed = true;
-      break;
-    case 'R': case 'r': // ВПРАВО
-      angle10 += 6;
-      changed = true;
-      break;
-    case 'L': case 'l': // ВЛЕВО
-      angle10 -= 6;
-      changed = true;
-      break;
-    case 'C': case 'c': case 'S': case 's': // ЦЕНТР
-      angle10 = 165;
-      angle11 = 125;
-      changed = true;
-      break;
-    default:
-      // Все остальные байты (переводы строк, мусор, шумы) — ИГНОРИРУЕМ!
-      break;
-  }
-
-  // Применяем углы ТОЛЬКО если была реальная команда
-  if (changed) {
-    angle10 = constrain(angle10, 150, 181); 
-    angle11 = constrain(angle11, 85, 165);
-
-    setAngle(servo10, angle10);
-    setAngle(servo11, angle11);
-
-    needSave = true;
-    lastSaveTime = millis();
-  }
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // таймаут 25 мс (~4.3 м)
+  if (duration <= 0) return -1;
+  return duration / 58.2;
 }
 
 void setup() {
-  Serial.begin(9600); // Связь с ESP32
+  Serial.begin(9600);
 
-  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
+  servoPan.attach(SERVO_PAN_PIN);
+  servoTilt.attach(SERVO_TILT_PIN);
 
-  pinMode(LIGHT_AO_PIN, INPUT);
-  pinMode(LIGHT_DO_PIN, INPUT);
+  loadFromEEPROM();
+  updateServos();
+
   pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
 
-  EEPROM.get(EEPROM_ADDR_10, angle10);
-  EEPROM.get(EEPROM_ADDR_11, angle11);
+  // Инициализация ИК без захвата 13 пина (чтобы не конфликтовал с Echo)
+  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
+  pinMode(ECHO_PIN, INPUT); // СТРОГО ПОСЛЕ IR!
 
-  if (angle10 < 150 || angle10 > 181) angle10 = 165;
-  if (angle11 < 85  || angle11 > 165) angle11 = 125;
-
-  servo10.attach(10, 500, 2500); 
-  servo11.attach(11, 500, 2500);
-
-  setAngle(servo10, angle10);
-  setAngle(servo11, angle11);
-
-  Serial.println("=== СИСТЕМА ГОТОВА: ФИЛЬТР ЛОЖНЫХ КОМАНД ВКЛЮЧЕН ===");
+  pinMode(LIGHT_DO_PIN, INPUT);
 }
 
 void loop() {
-  // 1. ПРИЕМ СИМВОЛОВ ОТ ESP32 (БЕЗ ЛОЖНЫХ СРАБАТЫВАНИЙ)
-  while (Serial.available()) {
+  // 1. Прием команд от ESP32-S3
+  if (Serial.available() > 0) {
     char cmd = Serial.read();
-    processESPCommand(cmd);
-  }
+    bool moved = false;
 
-  // 2. ИК-ПУЛЬТ
-  if (IrReceiver.decode()) {
-    lastIRTime = millis();
-
-    if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
-      activeCommand = IrReceiver.decodedIRData.command;
-    }
-
-    switch (activeCommand) {
-      case 0x18: dir11 = -1; break; 
-      case 0x52: dir11 = 1;  break; 
-      case 0x5A: dir10 = 1;  break; 
-      case 0x08: dir10 = -1; break; 
-      case 0x1C: case 0x38:
-        angle10 = 165; angle11 = 125;
-        setAngle(servo10, angle10);
-        setAngle(servo11, angle11);
-        dir10 = 0; dir11 = 0;
-        needSave = true; lastSaveTime = millis();
+    switch (cmd) {
+      case 'U': // Вверх (инверсия: уменьшаем угол наклона)
+        if (currentTilt - STEP_ANGLE >= TILT_MIN) {
+          currentTilt -= STEP_ANGLE;
+          moved = true;
+        }
+        break;
+      case 'D': // Вниз (инверсия: увеличиваем угол наклона)
+        if (currentTilt + STEP_ANGLE <= TILT_MAX) {
+          currentTilt += STEP_ANGLE;
+          moved = true;
+        }
+        break;
+      case 'L': // Влево
+        if (currentPan - STEP_ANGLE >= PAN_MIN) {
+          currentPan -= STEP_ANGLE;
+          moved = true;
+        }
+        break;
+      case 'R': // Вправо
+        if (currentPan + STEP_ANGLE <= PAN_MAX) {
+          currentPan += STEP_ANGLE;
+          moved = true;
+        }
+        break;
+      case 'C': // Центрирование
+      case 'S':
+        currentPan = PAN_CENTER;
+        currentTilt = TILT_CENTER;
+        moved = true;
+        break;
+      default:
+        // Все остальные байты (шум, \r, \n) отбрасываются
         break;
     }
-    IrReceiver.resume();
+
+    if (moved) {
+      updateServos();
+      saveToEEPROM();
+    }
   }
 
-  if (millis() - lastIRTime > 250) {
-    dir10 = 0; dir11 = 0; activeCommand = 0;
-  }
+  // 2. Периодическая посылка телеметрии в ESP32-S3
+  unsigned long now = millis();
+  if (now - lastTelemetryTime >= TELEMETRY_INTERVAL) {
+    lastTelemetryTime = now;
 
-  if ((dir10 != 0 || dir11 != 0) && (millis() - lastStepTime > MOVE_INTERVAL)) {
-    lastStepTime = millis();
-    angle10 += dir10; angle11 += dir11;
-    angle10 = constrain(angle10, 150, 181); 
-    angle11 = constrain(angle11, 85, 165);
-    setAngle(servo10, angle10);
-    setAngle(servo11, angle11);
-    needSave = true; lastSaveTime = millis();
-  }
-
-  // 3. СОХРАНЕНИЕ В ПАМЯТЬ
-  if (needSave && (millis() - lastSaveTime > 1000)) {
-    EEPROM.put(EEPROM_ADDR_10, angle10);
-    EEPROM.put(EEPROM_ADDR_11, angle11);
-    needSave = false;
-  }
-
-  // 4. ТЕЛЕМЕТРИЯ (выводим реже, чтобы не засорять шину)
-  if (millis() - lastSensorPrintTime > 1000) {
-    lastSensorPrintTime = millis();
-    long dist = getDistance();
+    long dist = readDistanceCM();
     int lightVal = analogRead(LIGHT_AO_PIN);
-    bool lightState = digitalRead(LIGHT_DO_PIN);
 
-    Serial.print("D:"); Serial.print(dist);
-    Serial.print(";L:"); Serial.print(lightVal);
-    Serial.print(";DO:"); Serial.println(lightState == HIGH ? 1 : 0);
+    // Формат пакета: DIST=XX;LIGHT=YY;PAN=ZZ;TILT=WW\n
+    Serial.print("DIST=");
+    Serial.print(dist);
+    Serial.print(";LIGHT=");
+    Serial.print(lightVal);
+    Serial.print(";PAN=");
+    Serial.print(currentPan);
+    Serial.print(";TILT=");
+    Serial.print(currentTilt);
+    Serial.println();
+  }
+
+  // 3. Обработка ИК пульта
+  if (IrReceiver.decode()) {
+    IrReceiver.resume();
   }
 }
